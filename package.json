@@ -1,0 +1,23 @@
+{
+  "name": "facebook-messenger-agenda-bot",
+  "version": "1.0.0",
+  "description": "Facebook Messenger Bot for deadline reminders and activity management",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "facebook",
+    "messenger",
+    "bot",
+    "agenda",
+    "reminder"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@dongdev/fca-unofficial": "^2.0.30",
+    "moment-timezone": "^0.5.45",
+    "node-cron": "^3.0.3"
+  }
+}
