@@ -1,0 +1,85 @@
+{
+  "activities": [
+    {
+      "id": "1764214032800",
+      "name": "Reporting_GROUP5",
+      "subject": "PE",
+      "deadline": "2025-12-08T16:00:00.000Z",
+      "time": null,
+      "createdBy": "100092567839096",
+      "createdAt": "2025-11-27T03:27:12.800Z"
+    },
+    {
+      "id": "1764214038561",
+      "name": "FIGMA",
+      "subject": "HCI",
+      "deadline": "2025-11-29T16:00:00.000Z",
+      "time": null,
+      "createdBy": "100092567839096",
+      "createdAt": "2025-11-27T03:27:18.562Z"
+    },
+    {
+      "id": "1764214076630",
+      "name": "PROJECT",
+      "subject": "Introduction to Computing",
+      "deadline": "2025-12-10T15:59:00.000Z",
+      "time": "11:59 PM",
+      "createdBy": "100092567839096",
+      "createdAt": "2025-11-27T03:27:56.630Z"
+    },
+    {
+      "id": "1764214083715",
+      "name": "Group_Reporting",
+      "subject": "ARTAPP",
+      "deadline": "2025-11-26T16:00:00.000Z",
+      "time": null,
+      "createdBy": "100092567839096",
+      "createdAt": "2025-11-27T03:28:03.715Z"
+    },
+    {
+      "id": "1764214109273",
+      "name": "PerformanceTask",
+      "subject": "Programming",
+      "deadline": "2025-12-04T16:00:00.000Z",
+      "time": null,
+      "createdBy": "100092567839096",
+      "createdAt": "2025-11-27T03:28:29.274Z"
+    },
+    {
+      "id": "1764214128476",
+      "name": "PETA",
+      "subject": "RPH",
+      "deadline": "2025-11-28T16:00:00.000Z",
+      "time": null,
+      "createdBy": "100092567839096",
+      "createdAt": "2025-11-27T03:28:48.476Z"
+    },
+    {
+      "id": "1764214133511",
+      "name": "QUIZ",
+      "subject": "RPH",
+      "deadline": "2025-11-28T16:00:00.000Z",
+      "time": null,
+      "createdBy": "100092567839096",
+      "createdAt": "2025-11-27T03:28:53.511Z"
+    },
+    {
+      "id": "1764214139603",
+      "name": "Essay:Why_Local_History_Matters",
+      "subject": "RPH",
+      "deadline": "2025-11-28T16:00:00.000Z",
+      "time": null,
+      "createdBy": "100092567839096",
+      "createdAt": "2025-11-27T03:28:59.603Z"
+    },
+    {
+      "id": "1764214144544",
+      "name": "ABC's_of_PRINT_DOCUMENT_&_VISUALS",
+      "subject": "PURCOM",
+      "deadline": "2025-11-29T16:00:00.000Z",
+      "time": null,
+      "createdBy": "100092567839096",
+      "createdAt": "2025-11-27T03:29:04.544Z"
+    }
+  ]
+}

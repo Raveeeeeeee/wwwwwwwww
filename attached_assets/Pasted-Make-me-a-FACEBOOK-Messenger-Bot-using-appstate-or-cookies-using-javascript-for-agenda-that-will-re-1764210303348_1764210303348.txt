@@ -1,0 +1,27 @@
+Make me a FACEBOOK Messenger Bot using appstate or cookies using javascript, for agenda that will remind or even notify a incoming deadline
+
+set the prefix to "/"
+
+100092567839096 is the PIO of the messenger group and 100004919079151 is the REPRESENTATIVE of the section, these we're like the higher ups, he and she will be the one to use the command /addact in order to add a reminder or an activity to the bot.
+
+/addact [Activity_Name] [Subject] [date of deadline] [time of deadline if possible to provide]
+
+The activity name if has space should be like this: /addact performance_task_3-Video_works English 10/23/2025 10:00pm
+
+The bot should categorize the activities base on the subjects, we only have 9 subjects but the PIO or the REPRESENTATIVE can add subject by executing command /addsub "Subject" and also can remove using /removesub "Sub" and also make a /listsub to show all subjects active. (/addsub and /removesub should only be available for PIO and REPRESENTATIVE)
+
+add a command /activities to show all pending activities, their name, subject category, date of deadline, and time of deadline if only provided by the PIO or REPRESENTATIVES.
+
+if the activities is shown, they should be categorized by subject to avoid unorganized list of activities.
+
+The time that should be used in this bot is PHILIPPINE BASED TIME, 12 HOURS FORMAT (12:00 am - 11:59 pm). Make sure the integrity of the time to make the bot function effectively because when the time is ineffective then the bot is ineffective.
+
+The activities should automatically be remove after a day of the deadline, for example the deadline is this day and then tomorrow the specific activity should be removed from the list, the bot will notify all of the group members that this specific activity has now ended.
+
+also add a command /extend [date of the deadline] [time of deadline if provided] to extend the deadline date and put an extension to the deadline, and the orginal deadline in the list should be replaced by the deadline put in the /extend (this should only be available to PIO and REPRESENTATIVES)
+
+When an specific activity's deadline is tomorrow, the bot will do @everyone mention in the group chat and announce that this specific activity or activities deadline is tomorrow.
+
+also make a /help command to show available commands
+
+if adding a space in the Activity Name, remind the PIO or REPRESENTATIVE to use "_" in the spaces to avoid problems.
