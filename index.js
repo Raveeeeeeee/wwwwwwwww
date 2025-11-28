@@ -15,8 +15,19 @@ const ACTIVITIES_FILE = "./data/activities.json";
 const SUBJECTS_FILE = "./data/subjects.json";
 const APPSTATE_FILE = "./appstate.json";
 
-// Thread ID for the group (will be set when bot receives first message from group)
-let groupThreadID = null;
+// Track ALL group thread IDs the bot is in
+const GROUP_THREADS_FILE = "./data/group_threads.json";
+
+function getGroupThreads() {
+  const data = loadJSON(GROUP_THREADS_FILE);
+  return data ? new Set(data.threads) : new Set();
+}
+
+function saveGroupThreads(threads) {
+  saveJSON(GROUP_THREADS_FILE, { threads: Array.from(threads) });
+}
+
+let groupThreadIDs = getGroupThreads();
 
 // Helper Functions
 function loadJSON(filePath) {
@@ -75,29 +86,63 @@ function formatTime(time) {
 
 function getCountdown(deadline, hasTime) {
   const now = getCurrentTime();
-  const deadlineMoment = moment.tz(deadline, TIMEZONE);
+  // Parse the ISO deadline and convert to Manila timezone
+  const deadlineMoment = moment(deadline).tz(TIMEZONE);
   
-  if (now.isSameOrAfter(deadlineMoment)) {
+  // Get start of today and start of deadline day in Manila timezone
+  const todayStart = now.clone().startOf('day');
+  const deadlineStart = deadlineMoment.clone().startOf('day');
+  
+  // Check if the deadline is today (same calendar day in Manila timezone)
+  const isToday = todayStart.isSame(deadlineStart, 'day');
+  
+  // For activities without specific time, deadline is end of that day
+  let effectiveDeadline = deadlineMoment;
+  if (!hasTime) {
+    effectiveDeadline = deadlineMoment.clone().endOf('day');
+  }
+  
+  // Check if deadline has passed
+  if (now.isAfter(effectiveDeadline)) {
+    if (isToday) {
+      return "TODAY";
+    }
     return "PASSED";
   }
   
-  const duration = moment.duration(deadlineMoment.diff(now));
+  // If it's today and deadline hasn't passed
+  if (isToday) {
+    if (hasTime) {
+      const duration = moment.duration(deadlineMoment.diff(now));
+      const hours = Math.floor(duration.asHours());
+      const minutes = duration.minutes();
+      
+      if (hours > 0) {
+        return `${hours}h ${minutes}m left`;
+      } else if (minutes > 0) {
+        return `${minutes}m left`;
+      } else {
+        return "< 1m left";
+      }
+    }
+    return "TODAY";
+  }
+  
+  // Calculate days difference
+  const daysDiff = deadlineStart.diff(todayStart, 'days');
+  
+  if (daysDiff === 1) {
+    return "TOMORROW";
+  }
+  
+  // More than 1 day away
+  const duration = moment.duration(effectiveDeadline.diff(now));
   const days = Math.floor(duration.asDays());
   const hours = duration.hours();
-  const minutes = duration.minutes();
   
   let parts = [];
   if (days > 0) parts.push(`${days}d`);
   if (hours > 0) parts.push(`${hours}h`);
-  if (hasTime && minutes > 0) parts.push(`${minutes}m`);
-  
-  if (parts.length === 0) {
-    if (hasTime) {
-      return "< 1m left";
-    } else {
-      return "Due today";
-    }
-  }
   
   return parts.join(" ") + " left";
 }
@@ -173,7 +218,7 @@ function parseDateTime(dateStr, timeStr) {
 }
 
 function formatDeadline(activity) {
-  const date = moment.tz(activity.deadline, TIMEZONE);
+  const date = moment(activity.deadline).tz(TIMEZONE);
   let formatted = date.format("MMMM D, YYYY");
   if (activity.time) {
     formatted += ` at ${activity.time}`;
@@ -183,6 +228,69 @@ function formatDeadline(activity) {
 
 function getActivityDisplayName(name) {
   return name.replace(/_/g, " ");
+}
+
+// Batch addact helper function (returns result instead of sending message)
+function executeBatchAddact(args, senderID) {
+  if (args.length < 3) {
+    return { success: false, activityName: args[0] || "Unknown", error: "Invalid format" };
+  }
+
+  const dateIndex = findDateIndex(args);
+  if (dateIndex === -1) {
+    return { success: false, activityName: args[0], error: "No valid date" };
+  }
+
+  if (dateIndex < 2) {
+    return { success: false, activityName: args[0], error: "Missing subject" };
+  }
+
+  const subjects = getSubjects();
+  const parsed = findSubjectInArgs(args, subjects);
+
+  if (!parsed) {
+    const attemptedSubject = args.slice(1, dateIndex).join(" ");
+    return { success: false, activityName: args[0], error: `Subject "${attemptedSubject}" not found` };
+  }
+
+  const { activityName, subject: subjectMatch, dateIndex: parsedDateIndex } = parsed;
+  const dateStr = args[parsedDateIndex];
+  const timeStr = args[parsedDateIndex + 1] || null;
+
+  if (!isValidTime(timeStr)) {
+    return { success: false, activityName: getActivityDisplayName(activityName), error: "Invalid time" };
+  }
+
+  const deadline = parseDateTime(dateStr, timeStr);
+  if (!deadline) {
+    return { success: false, activityName: getActivityDisplayName(activityName), error: "Invalid date" };
+  }
+
+  const activities = getActivities();
+  const exists = activities.find(
+    a => a.name.toLowerCase() === activityName.toLowerCase() && 
+         a.subject.toLowerCase() === subjectMatch.toLowerCase()
+  );
+
+  if (exists) {
+    return { success: false, activityName: getActivityDisplayName(activityName), error: "Already exists" };
+  }
+
+  const formattedTime = formatTime(timeStr);
+  const newActivity = {
+    id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
+    name: activityName,
+    subject: subjectMatch,
+    deadline: deadline.toISOString(),
+    time: formattedTime,
+    createdBy: senderID,
+    createdAt: getCurrentTime().toISOString()
+  };
+
+  activities.push(newActivity);
+  saveActivities(activities);
+
+  return { success: true, activityName: getActivityDisplayName(activityName) };
 }
 
 // Command Handlers
@@ -213,6 +321,8 @@ ${PREFIX}addsub [Subject]
 
 ${PREFIX}removesub [Subject]
 
+${PREFIX}listgroups - View tracked groups
+
 📝 Use _ for spaces in activity names
 📅 Date: MM/DD/YYYY | Time: 12hr (e.g. 10:00pm)`;
 
@@ -229,7 +339,7 @@ ${PREFIX}removesub [Subject]
       const now = getCurrentTime();
 
       const pendingActivities = activities.filter(act => {
-        const deadline = moment.tz(act.deadline, TIMEZONE);
+        const deadline = moment(act.deadline).tz(TIMEZONE);
         if (act.time) {
           return now.isBefore(deadline);
         } else {
@@ -257,7 +367,7 @@ ${PREFIX}removesub [Subject]
           message += `\n📚 ${subject}\n`;
           grouped[subject].forEach((act, i) => {
             const name = getActivityDisplayName(act.name);
-            const deadlineMoment = moment.tz(act.deadline, TIMEZONE);
+            const deadlineMoment = moment(act.deadline).tz(TIMEZONE);
             const dayName = deadlineMoment.format("dddd");
             const dateStr = deadlineMoment.format("MMM D, YYYY");
             const timeStr = act.time ? ` ${act.time}` : "";
@@ -273,7 +383,7 @@ ${PREFIX}removesub [Subject]
         message += `\n📚 Other\n`;
         otherActs.forEach((act, i) => {
           const name = getActivityDisplayName(act.name);
-          const deadlineMoment = moment.tz(act.deadline, TIMEZONE);
+          const deadlineMoment = moment(act.deadline).tz(TIMEZONE);
           const dayName = deadlineMoment.format("dddd");
           const dateStr = deadlineMoment.format("MMM D, YYYY");
           const timeStr = act.time ? ` ${act.time}` : "";
@@ -572,39 +682,101 @@ ${PREFIX}removesub [Subject]
 
       api.sendMessage(message, event.threadID);
     }
+  },
+
+  listgroups: {
+    description: "List all tracked groups",
+    adminOnly: true,
+    execute: (api, event, args) => {
+      if (groupThreadIDs.size === 0) {
+        api.sendMessage("📭 No groups registered yet!\n\nThe bot will automatically register groups when it receives messages from them.", event.threadID);
+        return;
+      }
+
+      let message = "📢 TRACKED GROUPS\n";
+      message += "━".repeat(25) + "\n\n";
+      message += `Total: ${groupThreadIDs.size} group(s)\n\n`;
+      
+      let index = 1;
+      groupThreadIDs.forEach(threadID => {
+        message += `${index}. ${threadID}\n`;
+        index++;
+      });
+      
+      message += "\n" + "━".repeat(25);
+      message += "\n\n💡 Reminders will be sent to ALL these groups.";
+
+      api.sendMessage(message, event.threadID);
+    }
   }
 };
+
+// Helper function to send message to ALL groups
+function sendToAllGroups(api, messageBody) {
+  if (groupThreadIDs.size === 0) {
+    console.log("⚠️ No groups registered yet");
+    return;
+  }
+  
+  groupThreadIDs.forEach(threadID => {
+    const message = {
+      body: messageBody,
+      mentions: [{ tag: "@everyone", id: threadID }]
+    };
+    api.sendMessage(message, threadID, (err) => {
+      if (err) {
+        console.error(`Failed to send to group ${threadID}:`, err.message);
+      }
+    });
+  });
+}
 
 // Scheduled Tasks
 function setupScheduledTasks(api) {
   // Check every minute for deadline reminders
   cron.schedule("* * * * *", () => {
-    if (!groupThreadID) return;
+    if (groupThreadIDs.size === 0) return;
 
     const now = getCurrentTime();
     const activities = getActivities();
     let updated = false;
 
     activities.forEach(activity => {
-      const deadline = moment.tz(activity.deadline, TIMEZONE);
-      const tomorrow = now.clone().add(1, "day").startOf("day");
+      const deadline = moment(activity.deadline).tz(TIMEZONE);
+      const tomorrowStart = now.clone().add(1, "day").startOf("day");
+      const tomorrowEnd = now.clone().add(1, "day").endOf("day");
       const dayAfterDeadline = deadline.clone().add(1, "day").startOf("day");
 
-      // Check if deadline is tomorrow (notify at 8 AM)
+      // Check if deadline is tomorrow (notify at 8 AM Manila time)
       if (!activity.notifiedTomorrow && 
-          deadline.isSame(tomorrow, "day") && 
+          deadline.isBetween(tomorrowStart, tomorrowEnd, null, '[]') && 
           now.hour() === 8 && now.minute() === 0) {
         
         const displayName = getActivityDisplayName(activity.name);
         const formattedDeadline = formatDeadline(activity);
         
-        const message = {
-          body: `🚨 DEADLINE REMINDER! 🚨\n\n@everyone\n\n⚠️ The following activity is due TOMORROW:\n\n📝 Activity: ${displayName}\n📚 Subject: ${activity.subject}\n📅 Deadline: ${formattedDeadline}\n\nPlease make sure to complete and submit on time!`,
-          mentions: [{ tag: "@everyone", id: groupThreadID }]
-        };
+        const messageBody = `🚨 DEADLINE REMINDER! 🚨\n\n@everyone\n\n⚠️ The following activity is due TOMORROW:\n\n📝 Activity: ${displayName}\n📚 Subject: ${activity.subject}\n📅 Deadline: ${formattedDeadline}\n\nPlease make sure to complete and submit on time!`;
         
-        api.sendMessage(message, groupThreadID);
+        sendToAllGroups(api, messageBody);
         activity.notifiedTomorrow = true;
+        updated = true;
+      }
+
+      // Check if deadline is TODAY (notify at 7 AM Manila time)
+      const todayStart = now.clone().startOf("day");
+      const todayEnd = now.clone().endOf("day");
+      
+      if (!activity.notifiedToday && 
+          deadline.isBetween(todayStart, todayEnd, null, '[]') && 
+          now.hour() === 7 && now.minute() === 0) {
+        
+        const displayName = getActivityDisplayName(activity.name);
+        const formattedDeadline = formatDeadline(activity);
+        
+        const messageBody = `📢 TODAY'S DEADLINE! 📢\n\n@everyone\n\n🔴 The following activity is due TODAY:\n\n📝 Activity: ${displayName}\n📚 Subject: ${activity.subject}\n📅 Deadline: ${formattedDeadline}\n\nMake sure to submit before the deadline!`;
+        
+        sendToAllGroups(api, messageBody);
+        activity.notifiedToday = true;
         updated = true;
       }
 
@@ -615,12 +787,9 @@ function setupScheduledTasks(api) {
         if (minutesUntilDeadline <= 30 && minutesUntilDeadline > 0) {
           const displayName = getActivityDisplayName(activity.name);
           
-          const message = {
-            body: `⏰ URGENT REMINDER! ⏰\n\n@everyone\n\n🔴 Only ${minutesUntilDeadline} minutes left!\n\n📝 Activity: ${displayName}\n📚 Subject: ${activity.subject}\n📅 Deadline: ${activity.time}\n\nPlease pass the required output as soon as possible!`,
-            mentions: [{ tag: "@everyone", id: groupThreadID }]
-          };
+          const messageBody = `⏰ URGENT REMINDER! ⏰\n\n@everyone\n\n🔴 Only ${minutesUntilDeadline} minutes left!\n\n📝 Activity: ${displayName}\n📚 Subject: ${activity.subject}\n📅 Deadline: ${activity.time}\n\nPlease pass the required output as soon as possible!`;
           
-          api.sendMessage(message, groupThreadID);
+          sendToAllGroups(api, messageBody);
           activity.notified30Min = true;
           updated = true;
         }
@@ -633,7 +802,7 @@ function setupScheduledTasks(api) {
       
       if (activity.time) {
         // Has specific time - end when deadline time has passed
-        if (now.isSameOrAfter(deadline)) {
+        if (now.isAfter(deadline)) {
           shouldEnd = true;
         }
       } else {
@@ -646,10 +815,9 @@ function setupScheduledTasks(api) {
       if (!activity.notifiedEnded && shouldEnd) {
         const displayName = getActivityDisplayName(activity.name);
         
-        api.sendMessage(
-          `📢 DEADLINE MET\n\n📝 Activity: ${displayName}\n📚 Subject: ${activity.subject}\n\nThis activity has now passed its deadline and has been removed from the list.`,
-          groupThreadID
-        );
+        const messageBody = `📢 DEADLINE MET\n\n📝 Activity: ${displayName}\n📚 Subject: ${activity.subject}\n\nThis activity has now passed its deadline and has been removed from the list.`;
+        
+        sendToAllGroups(api, messageBody);
         
         activity.notifiedEnded = true;
         activity.ended = true;
@@ -665,6 +833,7 @@ function setupScheduledTasks(api) {
   });
 
   console.log("✅ Scheduled tasks initialized");
+  console.log(`📢 Tracking ${groupThreadIDs.size} group(s) for reminders`);
 }
 
 // Main Bot Login
@@ -698,8 +867,7 @@ function startBot() {
     // Set options
     api.setOptions({
       listenEvents: true,
-      selfListen: false,
-      logLevel: "silent"
+      selfListen: false
     });
 
     // Save updated appstate
@@ -717,9 +885,13 @@ function startBot() {
         return;
       }
 
-      // Store group thread ID for notifications
+      // Track ALL group thread IDs for notifications
       if (event.isGroup && event.threadID) {
-        groupThreadID = event.threadID;
+        if (!groupThreadIDs.has(event.threadID)) {
+          groupThreadIDs.add(event.threadID);
+          saveGroupThreads(groupThreadIDs);
+          console.log(`📢 New group registered: ${event.threadID} (Total: ${groupThreadIDs.size} groups)`);
+        }
       }
 
       // Handle bot being added to a group
@@ -728,6 +900,13 @@ function startBot() {
         const botWasAdded = addedParticipants.some(p => p.userFbId === botID);
         
         if (botWasAdded && event.threadID) {
+          // Add this group to the tracked list
+          if (!groupThreadIDs.has(event.threadID)) {
+            groupThreadIDs.add(event.threadID);
+            saveGroupThreads(groupThreadIDs);
+            console.log(`📢 Bot added to new group: ${event.threadID} (Total: ${groupThreadIDs.size} groups)`);
+          }
+          
           api.changeNickname("Task Scheduler", event.threadID, botID, (err) => {
             if (err) {
               console.error("Failed to set nickname:", err);
@@ -743,10 +922,72 @@ function startBot() {
 
       const body = event.body.trim();
 
-      // Check if message starts with prefix
-      if (!body.startsWith(PREFIX)) return;
+      // Check if message contains any commands
+      if (!body.includes(PREFIX)) return;
 
-      // Parse command and arguments
+      // Split message by newlines to support batch commands
+      const lines = body.split(/\n/).map(line => line.trim()).filter(line => line.startsWith(PREFIX));
+
+      if (lines.length === 0) return;
+
+      // Process multiple commands (batch mode)
+      if (lines.length > 1) {
+        let successCount = 0;
+        let failCount = 0;
+        let results = [];
+
+        for (const line of lines) {
+          const args = line.slice(PREFIX.length).split(/\s+/);
+          const commandName = args.shift().toLowerCase();
+          const command = commands[commandName];
+
+          if (!command) {
+            failCount++;
+            results.push(`❌ ${args[0] || commandName} - Unknown command`);
+            continue;
+          }
+
+          if (command.adminOnly && !isAdmin(event.senderID)) {
+            failCount++;
+            results.push(`❌ ${args[0] || commandName} - Admin only`);
+            continue;
+          }
+
+          try {
+            // For batch mode, we need to capture results instead of sending individual messages
+            if (commandName === "addact") {
+              const batchResult = executeBatchAddact(args, event.senderID);
+              if (batchResult.success) {
+                successCount++;
+                results.push(`✅ ${batchResult.activityName} - Added`);
+              } else {
+                failCount++;
+                results.push(`❌ ${batchResult.activityName || args[0]} - ${batchResult.error}`);
+              }
+            } else {
+              // For non-addact commands in batch, execute normally
+              command.execute(api, event, args);
+              successCount++;
+            }
+          } catch (error) {
+            console.error(`Error executing ${commandName}:`, error);
+            failCount++;
+            results.push(`❌ ${args[0] || commandName} - Error`);
+          }
+        }
+
+        // Send batch summary
+        let summary = `📋 Batch Command Results\n`;
+        summary += `━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+        summary += results.join("\n");
+        summary += `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        summary += `✅ Success: ${successCount} | ❌ Failed: ${failCount}`;
+
+        api.sendMessage(summary, event.threadID);
+        return;
+      }
+
+      // Single command mode (original behavior)
       const args = body.slice(PREFIX.length).split(/\s+/);
       const commandName = args.shift().toLowerCase();
 
