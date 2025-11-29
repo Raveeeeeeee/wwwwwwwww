@@ -9,14 +9,27 @@ const TIMEZONE = "Asia/Manila";
 const PIO_ID = "100092567839096";
 const REPRESENTATIVE_ID = "100004919079151";
 const ADMINS = [PIO_ID, REPRESENTATIVE_ID];
+const AUTO_UNSEND_DELAY = 10 * 60 * 1000; // 10 minutes in milliseconds
 
 // Data file paths
-const ACTIVITIES_FILE = "./data/activities.json";
 const SUBJECTS_FILE = "./data/subjects.json";
 const APPSTATE_FILE = "./appstate.json";
-
-// Track ALL group thread IDs the bot is in
 const GROUP_THREADS_FILE = "./data/group_threads.json";
+const GROUP_DATA_DIR = "./data/groups";
+
+// Ensure group data directory exists
+if (!fs.existsSync(GROUP_DATA_DIR)) {
+  fs.mkdirSync(GROUP_DATA_DIR, { recursive: true });
+}
+
+// Legacy activities file path (for migration)
+const LEGACY_ACTIVITIES_FILE = "./data/activities.json";
+
+// Track groups that have been initialized this session
+const initializedGroups = new Set();
+
+// Track legacy data for migration to all groups
+let legacyActivitiesCache = null;
 
 function getGroupThreads() {
   const data = loadJSON(GROUP_THREADS_FILE);
@@ -51,13 +64,103 @@ function saveJSON(filePath, data) {
   }
 }
 
-function getActivities() {
-  const data = loadJSON(ACTIVITIES_FILE);
-  return data ? data.activities : [];
+// Per-group data functions
+function getGroupDataPath(threadID) {
+  return `${GROUP_DATA_DIR}/${threadID}.json`;
 }
 
-function saveActivities(activities) {
-  saveJSON(ACTIVITIES_FILE, { activities });
+function getGroupActivities(threadID) {
+  const filePath = getGroupDataPath(threadID);
+  const data = loadJSON(filePath);
+  if (!data || !data.activities) return [];
+  
+  // Normalize activities to ensure all notification flags exist
+  let needsSave = false;
+  const normalizedActivities = data.activities.map(act => {
+    // Check if any new flags are missing
+    if (act.notifiedNextWeek === undefined || 
+        act.notifiedThisWeek === undefined || 
+        act.notified2Days === undefined) {
+      needsSave = true;
+    }
+    return {
+      ...act,
+      notifiedNextWeek: act.notifiedNextWeek || false,
+      notifiedThisWeek: act.notifiedThisWeek || false,
+      notified2Days: act.notified2Days || false,
+      notifiedTomorrow: act.notifiedTomorrow || false,
+      notifiedToday: act.notifiedToday || false,
+      notified30Min: act.notified30Min || false,
+      notifiedEnded: act.notifiedEnded || false,
+      ended: act.ended || false
+    };
+  });
+  
+  // Persist normalized data back to disk if flags were missing
+  if (needsSave) {
+    saveGroupActivities(threadID, normalizedActivities);
+    console.log(`📦 Normalized activity flags for group ${threadID}`);
+  }
+  
+  return normalizedActivities;
+}
+
+function saveGroupActivities(threadID, activities) {
+  const filePath = getGroupDataPath(threadID);
+  saveJSON(filePath, { activities, lastUpdated: getCurrentTime().toISOString() });
+}
+
+function initializeGroupData(threadID, shouldMigrateLegacy = true) {
+  const filePath = getGroupDataPath(threadID);
+  if (!fs.existsSync(filePath)) {
+    // Check if there's legacy data to migrate
+    // We cache the legacy data so all groups get the same initial copy
+    if (shouldMigrateLegacy && legacyActivitiesCache === null) {
+      const legacyData = loadJSON(LEGACY_ACTIVITIES_FILE);
+      if (legacyData && legacyData.activities && legacyData.activities.length > 0) {
+        legacyActivitiesCache = legacyData.activities;
+      } else {
+        legacyActivitiesCache = []; // No legacy data
+      }
+    }
+    
+    // Migrate legacy data to this group (each group gets its own independent copy)
+    if (shouldMigrateLegacy && legacyActivitiesCache && legacyActivitiesCache.length > 0) {
+      // Create a deep copy so each group has completely independent data
+      // Reset all notification flags and generate new unique IDs
+      const migratedActivities = legacyActivitiesCache.map(act => {
+        // Deep clone the activity with fresh IDs and reset notification flags
+        return {
+          id: Date.now().toString() + Math.random().toString(36).substr(2, 9), // New unique ID
+          name: act.name,
+          subject: act.subject,
+          deadline: act.deadline,
+          time: act.time || null,
+          createdBy: act.createdBy,
+          createdAt: act.createdAt,
+          // Reset all notification flags for this group
+          notifiedNextWeek: false,
+          notifiedThisWeek: false,
+          notified2Days: false,
+          notifiedTomorrow: false,
+          notifiedToday: false,
+          notified30Min: false,
+          notifiedEnded: false,
+          ended: false,
+          // Mark as migrated
+          migratedFrom: "legacy",
+          migratedAt: getCurrentTime().toISOString()
+        };
+      });
+      saveGroupActivities(threadID, migratedActivities);
+      console.log(`📦 Migrated ${migratedActivities.length} legacy activities to group ${threadID}`);
+    } else {
+      // Create empty activities for new group (when no legacy data exists)
+      saveGroupActivities(threadID, []);
+      console.log(`📦 Initialized empty data for group ${threadID}`);
+    }
+  }
+  initializedGroups.add(threadID);
 }
 
 function getSubjects() {
@@ -96,8 +199,8 @@ function getCountdown(deadline, hasTime) {
   // Check if the deadline is today (same calendar day in Manila timezone)
   const isToday = todayStart.isSame(deadlineStart, 'day');
   
-  // For activities without specific time, deadline is end of that day
-  let effectiveDeadline = deadlineMoment;
+  // For activities without specific time, deadline is end of that day (11:59:59 PM)
+  let effectiveDeadline = deadlineMoment.clone();
   if (!hasTime) {
     effectiveDeadline = deadlineMoment.clone().endOf('day');
   }
@@ -105,7 +208,7 @@ function getCountdown(deadline, hasTime) {
   // Check if deadline has passed
   if (now.isAfter(effectiveDeadline)) {
     if (isToday) {
-      return "TODAY";
+      return "TODAY (PASSED)";
     }
     return "PASSED";
   }
@@ -128,23 +231,24 @@ function getCountdown(deadline, hasTime) {
     return "TODAY";
   }
   
-  // Calculate days difference
-  const daysDiff = deadlineStart.diff(todayStart, 'days');
-  
-  if (daysDiff === 1) {
+  // Check if it's tomorrow
+  const tomorrowStart = todayStart.clone().add(1, 'day');
+  if (deadlineStart.isSame(tomorrowStart, 'day')) {
     return "TOMORROW";
   }
   
-  // More than 1 day away
+  // Calculate precise time difference
   const duration = moment.duration(effectiveDeadline.diff(now));
-  const days = Math.floor(duration.asDays());
+  const totalDays = Math.floor(duration.asDays());
   const hours = duration.hours();
+  const minutes = duration.minutes();
   
   let parts = [];
-  if (days > 0) parts.push(`${days}d`);
+  if (totalDays > 0) parts.push(`${totalDays}d`);
   if (hours > 0) parts.push(`${hours}h`);
+  if (totalDays === 0 && minutes > 0) parts.push(`${minutes}m`);
   
-  return parts.join(" ") + " left";
+  return parts.length > 0 ? parts.join(" ") + " left" : "< 1m left";
 }
 
 function isValidTime(timeStr) {
@@ -197,9 +301,9 @@ function findSubjectInArgs(args, subjects) {
 }
 
 function parseDate(dateStr) {
-  // Parse date in MM/DD/YYYY format
+  // Parse date in MM/DD/YYYY format with strict Manila timezone
   const formats = ["MM/DD/YYYY", "M/D/YYYY", "MM/D/YYYY", "M/DD/YYYY"];
-  const parsed = moment.tz(dateStr, formats, TIMEZONE);
+  const parsed = moment.tz(dateStr, formats, true, TIMEZONE);
   return parsed.isValid() ? parsed : null;
 }
 
@@ -208,11 +312,19 @@ function parseDateTime(dateStr, timeStr) {
   if (!date) return null;
 
   if (timeStr) {
-    const time = moment(timeStr, ["h:mma", "h:mm a", "HH:mm", "ha", "h a"]);
+    const time = moment(timeStr, ["h:mma", "h:mm a", "HH:mm", "ha", "h a"], true);
     if (time.isValid()) {
       date.hour(time.hour());
       date.minute(time.minute());
+      date.second(0);
+      date.millisecond(0);
     }
+  } else {
+    // If no time specified, set to start of day in Manila timezone
+    date.hour(0);
+    date.minute(0);
+    date.second(0);
+    date.millisecond(0);
   }
   return date;
 }
@@ -230,8 +342,103 @@ function getActivityDisplayName(name) {
   return name.replace(/_/g, " ");
 }
 
+// Helper function to get ISO week number in Manila timezone
+function getWeekNumber(date) {
+  const d = moment(date).tz(TIMEZONE);
+  return d.isoWeek();
+}
+
+// Helper function to get year-week string for comparison (e.g., "2025-W48")
+function getYearWeek(date) {
+  const d = moment(date).tz(TIMEZONE);
+  return `${d.isoWeekYear()}-W${d.isoWeek()}`;
+}
+
+// Helper function to format remaining time until deadline (for NEXT WEEK and THIS WEEK reminders)
+function formatTimeRemaining(deadline, hasTime) {
+  const now = getCurrentTime();
+  const deadlineMoment = moment(deadline).tz(TIMEZONE);
+  
+  // For activities without specific time, deadline is end of that day
+  let effectiveDeadline = deadlineMoment.clone();
+  if (!hasTime) {
+    effectiveDeadline = deadlineMoment.clone().endOf('day');
+  }
+  
+  const duration = moment.duration(effectiveDeadline.diff(now));
+  const totalDays = Math.floor(duration.asDays());
+  const hours = duration.hours();
+  const minutes = duration.minutes();
+  
+  let parts = [];
+  if (totalDays > 0) parts.push(`${totalDays} day${totalDays > 1 ? 's' : ''}`);
+  if (hours > 0) parts.push(`${hours} hour${hours > 1 ? 's' : ''}`);
+  if (totalDays === 0 && minutes > 0) parts.push(`${minutes} minute${minutes > 1 ? 's' : ''}`);
+  
+  return parts.length > 0 ? parts.join(", ") : "less than a minute";
+}
+
+// Check if deadline is in the next week (following Monday to Sunday)
+function isDeadlineNextWeek(deadline) {
+  const now = getCurrentTime();
+  const deadlineMoment = moment(deadline).tz(TIMEZONE);
+  
+  // Get next Monday (start of next week)
+  const nextMonday = now.clone().startOf('isoWeek').add(1, 'week');
+  // Get next Sunday (end of next week)
+  const nextSunday = nextMonday.clone().endOf('isoWeek');
+  
+  return deadlineMoment.isBetween(nextMonday, nextSunday, 'day', '[]');
+}
+
+// Check if deadline is in the current week (this Monday to this Saturday - excluding Sunday)
+function isDeadlineThisWeek(deadline) {
+  const now = getCurrentTime();
+  const deadlineMoment = moment(deadline).tz(TIMEZONE);
+  
+  // Get this Monday (start of current week)
+  const thisMonday = now.clone().startOf('isoWeek');
+  // Get this Saturday (end of week minus Sunday)
+  const thisSaturday = thisMonday.clone().add(5, 'days').endOf('day');
+  
+  return deadlineMoment.isBetween(thisMonday, thisSaturday, 'day', '[]');
+}
+
+// Check if activity was created in the current week
+function wasCreatedThisWeek(createdAt) {
+  const now = getCurrentTime();
+  const createdMoment = moment(createdAt).tz(TIMEZONE);
+  
+  return getYearWeek(now) === getYearWeek(createdMoment);
+}
+
+// Check if deadline is 2 days from now
+function isDeadlineIn2Days(deadline) {
+  const now = getCurrentTime();
+  const deadlineMoment = moment(deadline).tz(TIMEZONE);
+  
+  const twoDaysFromNow = now.clone().add(2, 'days').startOf('day');
+  const twoDaysFromNowEnd = twoDaysFromNow.clone().endOf('day');
+  
+  return deadlineMoment.isBetween(twoDaysFromNow, twoDaysFromNowEnd, 'day', '[]');
+}
+
+// Helper function to send a simple message
+function sendSimpleMessage(api, threadID, messageBody) {
+  return new Promise((resolve) => {
+    api.sendMessage(messageBody, threadID, (err, messageInfo) => {
+      if (err) {
+        console.error(`Failed to send message to ${threadID}:`, err.message);
+        resolve(null);
+      } else {
+        resolve(messageInfo);
+      }
+    });
+  });
+}
+
 // Batch addact helper function (returns result instead of sending message)
-function executeBatchAddact(args, senderID) {
+function executeBatchAddact(args, senderID, threadID) {
   if (args.length < 3) {
     return { success: false, activityName: args[0] || "Unknown", error: "Invalid format" };
   }
@@ -266,7 +473,7 @@ function executeBatchAddact(args, senderID) {
     return { success: false, activityName: getActivityDisplayName(activityName), error: "Invalid date" };
   }
 
-  const activities = getActivities();
+  const activities = getGroupActivities(threadID);
   const exists = activities.find(
     a => a.name.toLowerCase() === activityName.toLowerCase() && 
          a.subject.toLowerCase() === subjectMatch.toLowerCase()
@@ -284,11 +491,20 @@ function executeBatchAddact(args, senderID) {
     deadline: deadline.toISOString(),
     time: formattedTime,
     createdBy: senderID,
-    createdAt: getCurrentTime().toISOString()
+    createdAt: getCurrentTime().toISOString(),
+    // Initialize notification flags
+    notifiedNextWeek: false,
+    notifiedThisWeek: false,
+    notified2Days: false,
+    notifiedTomorrow: false,
+    notifiedToday: false,
+    notified30Min: false,
+    notifiedEnded: false,
+    ended: false
   };
 
   activities.push(newActivity);
-  saveActivities(activities);
+  saveGroupActivities(threadID, activities);
 
   return { success: true, activityName: getActivityDisplayName(activityName) };
 }
@@ -334,7 +550,14 @@ ${PREFIX}listgroups - View tracked groups
     description: "Show all pending activities",
     adminOnly: false,
     execute: (api, event, args) => {
-      const activities = getActivities();
+      const threadID = event.threadID;
+      
+      // Ensure group data is initialized
+      if (!initializedGroups.has(threadID)) {
+        initializeGroupData(threadID, false);
+      }
+      
+      const activities = getGroupActivities(threadID);
       const subjects = getSubjects();
       const now = getCurrentTime();
 
@@ -343,8 +566,9 @@ ${PREFIX}listgroups - View tracked groups
         if (act.time) {
           return now.isBefore(deadline);
         } else {
-          const dayAfterDeadline = deadline.clone().add(1, "day").startOf("day");
-          return now.isBefore(dayAfterDeadline);
+          // For activities without time, they're valid until end of deadline day
+          const endOfDeadlineDay = deadline.clone().endOf("day");
+          return now.isBefore(endOfDeadlineDay);
         }
       });
 
@@ -392,7 +616,24 @@ ${PREFIX}listgroups - View tracked groups
         });
       }
 
-      api.sendMessage(message.trim(), event.threadID);
+      // Send message and schedule auto-unsend after 10 minutes
+      api.sendMessage(message.trim(), event.threadID, (err, messageInfo) => {
+        if (err) {
+          console.error("Failed to send activities message:", err.message);
+          return;
+        }
+        
+        // Schedule auto-unsend after 10 minutes
+        setTimeout(() => {
+          api.unsendMessage(messageInfo.messageID, (unsendErr) => {
+            if (unsendErr) {
+              console.error("Failed to unsend activities message:", unsendErr.message);
+            } else {
+              console.log(`✅ Auto-unsent activities message in thread ${event.threadID}`);
+            }
+          });
+        }, AUTO_UNSEND_DELAY);
+      });
     }
   },
 
@@ -400,6 +641,13 @@ ${PREFIX}listgroups - View tracked groups
     description: "Add a new activity",
     adminOnly: true,
     execute: (api, event, args) => {
+      const threadID = event.threadID;
+      
+      // Ensure group data is initialized
+      if (!initializedGroups.has(threadID)) {
+        initializeGroupData(threadID, false);
+      }
+      
       if (args.length < 3) {
         api.sendMessage(
           `❌ Invalid format!\n\nUsage: ${PREFIX}addact [Activity_Name] [Subject] [Date] [Time]\n\nExample: ${PREFIX}addact Performance_Task_3 English 10/23/2025 10:00pm\nExample: ${PREFIX}addact Quiz_1 Araling Panlipunan 12/01/2025\n\n💡 Remember: Use underscores (_) for spaces in activity names!`,
@@ -458,7 +706,7 @@ ${PREFIX}listgroups - View tracked groups
         return;
       }
 
-      const activities = getActivities();
+      const activities = getGroupActivities(threadID);
       const exists = activities.find(
         a => a.name.toLowerCase() === activityName.toLowerCase() && 
              a.subject.toLowerCase() === subjectMatch.toLowerCase()
@@ -480,11 +728,20 @@ ${PREFIX}listgroups - View tracked groups
         deadline: deadline.toISOString(),
         time: formattedTime,
         createdBy: event.senderID,
-        createdAt: getCurrentTime().toISOString()
+        createdAt: getCurrentTime().toISOString(),
+        // Initialize notification flags
+        notifiedNextWeek: false,
+        notifiedThisWeek: false,
+        notified2Days: false,
+        notifiedTomorrow: false,
+        notifiedToday: false,
+        notified30Min: false,
+        notifiedEnded: false,
+        ended: false
       };
 
       activities.push(newActivity);
-      saveActivities(activities);
+      saveGroupActivities(threadID, activities);
 
       const displayName = getActivityDisplayName(activityName);
       const formattedDeadline = formatDeadline(newActivity);
@@ -500,6 +757,13 @@ ${PREFIX}listgroups - View tracked groups
     description: "Extend activity deadline",
     adminOnly: true,
     execute: (api, event, args) => {
+      const threadID = event.threadID;
+      
+      // Ensure group data is initialized
+      if (!initializedGroups.has(threadID)) {
+        initializeGroupData(threadID, false);
+      }
+      
       if (args.length < 2) {
         api.sendMessage(
           `❌ Invalid format!\n\nUsage: ${PREFIX}extend [Activity_Name] [New_Date] [New_Time]\n\nExample: ${PREFIX}extend Performance_Task_3 10/25/2025 11:59pm`,
@@ -520,7 +784,7 @@ ${PREFIX}listgroups - View tracked groups
         return;
       }
 
-      const activities = getActivities();
+      const activities = getGroupActivities(threadID);
       const activityIndex = activities.findIndex(
         a => a.name.toLowerCase() === activityName.toLowerCase()
       );
@@ -551,7 +815,7 @@ ${PREFIX}listgroups - View tracked groups
       activities[activityIndex].extendedBy = event.senderID;
       activities[activityIndex].extendedAt = getCurrentTime().toISOString();
 
-      saveActivities(activities);
+      saveGroupActivities(threadID, activities);
 
       const displayName = getActivityDisplayName(activityName);
       const formattedNewDeadline = formatDeadline(activities[activityIndex]);
@@ -567,6 +831,13 @@ ${PREFIX}listgroups - View tracked groups
     description: "Remove an activity",
     adminOnly: true,
     execute: (api, event, args) => {
+      const threadID = event.threadID;
+      
+      // Ensure group data is initialized
+      if (!initializedGroups.has(threadID)) {
+        initializeGroupData(threadID, false);
+      }
+      
       if (args.length < 1) {
         api.sendMessage(
           `❌ Please provide the activity name.\n\nUsage: ${PREFIX}removeact [Activity_Name]`,
@@ -576,7 +847,7 @@ ${PREFIX}listgroups - View tracked groups
       }
 
       const activityName = args[0];
-      const activities = getActivities();
+      const activities = getGroupActivities(threadID);
       const activityIndex = activities.findIndex(
         a => a.name.toLowerCase() === activityName.toLowerCase()
       );
@@ -590,7 +861,7 @@ ${PREFIX}listgroups - View tracked groups
       }
 
       const removed = activities.splice(activityIndex, 1)[0];
-      saveActivities(activities);
+      saveGroupActivities(threadID, activities);
 
       const displayName = getActivityDisplayName(removed.name);
       api.sendMessage(
@@ -699,141 +970,379 @@ ${PREFIX}listgroups - View tracked groups
       
       let index = 1;
       groupThreadIDs.forEach(threadID => {
-        message += `${index}. ${threadID}\n`;
+        const activities = getGroupActivities(threadID);
+        message += `${index}. ${threadID}\n   📋 Activities: ${activities.length}\n`;
         index++;
       });
       
       message += "\n" + "━".repeat(25);
-      message += "\n\n💡 Reminders will be sent to ALL these groups.";
+      message += "\n\n💡 Each group has its own separate activities.";
 
       api.sendMessage(message, event.threadID);
     }
   }
 };
 
-// Helper function to send message to ALL groups
-function sendToAllGroups(api, messageBody) {
-  if (groupThreadIDs.size === 0) {
-    console.log("⚠️ No groups registered yet");
-    return;
-  }
-  
-  groupThreadIDs.forEach(threadID => {
-    const message = {
-      body: messageBody,
-      mentions: [{ tag: "@everyone", id: threadID }]
-    };
-    api.sendMessage(message, threadID, (err) => {
-      if (err) {
-        console.error(`Failed to send to group ${threadID}:`, err.message);
-      }
-    });
-  });
-}
-
 // Scheduled Tasks
 function setupScheduledTasks(api) {
+  // Track the last time slot we sent the motivational message (YYYY-MM-DD HH:mm format)
+  let lastMotivationalTimeSlot = "";
+  
   // Check every minute for deadline reminders
-  cron.schedule("* * * * *", () => {
+  cron.schedule("* * * * *", async () => {
     if (groupThreadIDs.size === 0) return;
 
     const now = getCurrentTime();
-    const activities = getActivities();
-    let updated = false;
-
-    activities.forEach(activity => {
-      const deadline = moment(activity.deadline).tz(TIMEZONE);
-      const tomorrowStart = now.clone().add(1, "day").startOf("day");
-      const tomorrowEnd = now.clone().add(1, "day").endOf("day");
-      const dayAfterDeadline = deadline.clone().add(1, "day").startOf("day");
-
-      // Check if deadline is tomorrow (notify at 8 AM Manila time)
-      if (!activity.notifiedTomorrow && 
-          deadline.isBetween(tomorrowStart, tomorrowEnd, null, '[]') && 
-          now.hour() === 8 && now.minute() === 0) {
-        
-        const displayName = getActivityDisplayName(activity.name);
-        const formattedDeadline = formatDeadline(activity);
-        
-        const messageBody = `🚨 DEADLINE REMINDER! 🚨\n\n@everyone\n\n⚠️ The following activity is due TOMORROW:\n\n📝 Activity: ${displayName}\n📚 Subject: ${activity.subject}\n📅 Deadline: ${formattedDeadline}\n\nPlease make sure to complete and submit on time!`;
-        
-        sendToAllGroups(api, messageBody);
-        activity.notifiedTomorrow = true;
-        updated = true;
+    const currentMinute = now.minute();
+    const currentHour = now.hour();
+    const currentDay = now.day(); // 0 = Sunday, 5 = Friday, 6 = Saturday
+    const currentTimeSlot = now.format("YYYY-MM-DD HH:mm");
+    
+    const isFriday = currentDay === 5;
+    const isSaturday = currentDay === 6;
+    const isSunday = currentDay === 0;
+    const isFridayOrSaturday = isFriday || isSaturday;
+    
+    // Track which groups received reminders this cycle
+    const groupsWithReminders = new Set();
+    // Track which groups got NEXT WEEK reminders (for motivational message on Fri/Sat)
+    const groupsWithNextWeekReminders = new Set();
+    
+    // Process each group separately and sequentially to avoid race conditions
+    for (const threadID of groupThreadIDs) {
+      // Ensure group data is initialized
+      if (!initializedGroups.has(threadID)) {
+        initializeGroupData(threadID, false);
       }
-
-      // Check if deadline is TODAY (notify at 7 AM Manila time)
-      const todayStart = now.clone().startOf("day");
-      const todayEnd = now.clone().endOf("day");
       
-      if (!activity.notifiedToday && 
-          deadline.isBetween(todayStart, todayEnd, null, '[]') && 
-          now.hour() === 7 && now.minute() === 0) {
+      const activities = getGroupActivities(threadID);
+      let updated = false;
+      
+      // Consolidation: Collect all reminders for this group in a single message
+      const consolidatedReminders = {
+        nextWeek: [],    // Activities due next week
+        thisWeek: [],    // Activities due this week
+        twoDays: [],     // Activities due in 2 days
+        tomorrow: [],    // Activities due tomorrow
+        today: [],       // Activities due today
+        thirtyMin: [],   // Activities due in 30 minutes
+        ended: []        // Activities that have passed deadline
+      };
+
+      for (const activity of activities) {
+        const deadline = moment(activity.deadline).tz(TIMEZONE);
+        const deadlineDay = deadline.day(); // 0 = Sunday
+        const todayStart = now.clone().startOf("day");
+        const todayEnd = now.clone().endOf("day");
+        const tomorrowStart = now.clone().add(1, "day").startOf("day");
+        const tomorrowEnd = now.clone().add(1, "day").endOf("day");
+        const dayAfterDeadline = deadline.clone().add(1, "day").startOf("day");
         
         const displayName = getActivityDisplayName(activity.name);
         const formattedDeadline = formatDeadline(activity);
-        
-        const messageBody = `📢 TODAY'S DEADLINE! 📢\n\n@everyone\n\n🔴 The following activity is due TODAY:\n\n📝 Activity: ${displayName}\n📚 Subject: ${activity.subject}\n📅 Deadline: ${formattedDeadline}\n\nMake sure to submit before the deadline!`;
-        
-        sendToAllGroups(api, messageBody);
-        activity.notifiedToday = true;
-        updated = true;
-      }
+        const timeRemaining = formatTimeRemaining(activity.deadline, !!activity.time);
+        const deadlineDayName = deadline.format("dddd");
 
-      // Check if deadline is 30 minutes away (only for activities with specific time)
-      if (!activity.notified30Min && activity.time) {
-        const minutesUntilDeadline = deadline.diff(now, "minutes");
+        // NEXT WEEK reminder - Only on Friday (8 AM) or Saturday (8 AM)
+        // Deadline must be in the next week (Monday to Sunday)
+        if (!activity.notifiedNextWeek && 
+            isFridayOrSaturday && 
+            currentHour === 8 && currentMinute === 0 &&
+            isDeadlineNextWeek(activity.deadline)) {
+          
+          consolidatedReminders.nextWeek.push({
+            name: displayName,
+            subject: activity.subject,
+            deadline: formattedDeadline,
+            dayName: deadlineDayName,
+            timeRemaining: timeRemaining
+          });
+          
+          activity.notifiedNextWeek = true;
+          updated = true;
+        }
+
+        // THIS WEEK reminder - Only on Sunday (8 AM)
+        // Deadline must be Monday-Saturday of current week
+        // Activity must NOT have been created this week
+        // Deadline must NOT be Sunday
+        if (!activity.notifiedThisWeek && 
+            isSunday && 
+            currentHour === 8 && currentMinute === 0 &&
+            isDeadlineThisWeek(activity.deadline) &&
+            deadlineDay !== 0 && // Deadline is not Sunday
+            !wasCreatedThisWeek(activity.createdAt)) {
+          
+          consolidatedReminders.thisWeek.push({
+            name: displayName,
+            subject: activity.subject,
+            deadline: formattedDeadline,
+            dayName: deadlineDayName,
+            timeRemaining: timeRemaining
+          });
+          
+          activity.notifiedThisWeek = true;
+          updated = true;
+        }
+
+        // 2 DAYS reminder - at 8 AM when deadline is in 2 days
+        if (!activity.notified2Days && 
+            isDeadlineIn2Days(activity.deadline) &&
+            currentHour === 8 && currentMinute === 0) {
+          
+          consolidatedReminders.twoDays.push({
+            name: displayName,
+            subject: activity.subject,
+            deadline: formattedDeadline,
+            timeRemaining: timeRemaining
+          });
+          
+          activity.notified2Days = true;
+          updated = true;
+        }
+
+        // TOMORROW reminder - at 8 AM when deadline is tomorrow
+        if (!activity.notifiedTomorrow && 
+            deadline.isBetween(tomorrowStart, tomorrowEnd, null, '[]') && 
+            currentHour === 8 && currentMinute === 0) {
+          
+          consolidatedReminders.tomorrow.push({
+            name: displayName,
+            subject: activity.subject,
+            deadline: formattedDeadline,
+            timeRemaining: timeRemaining
+          });
+          
+          activity.notifiedTomorrow = true;
+          updated = true;
+        }
+
+        // TODAY reminder - at 7 AM when deadline is today
+        if (!activity.notifiedToday && 
+            deadline.isBetween(todayStart, todayEnd, null, '[]') && 
+            currentHour === 7 && currentMinute === 0) {
+          
+          consolidatedReminders.today.push({
+            name: displayName,
+            subject: activity.subject,
+            deadline: formattedDeadline,
+            timeRemaining: timeRemaining
+          });
+          
+          activity.notifiedToday = true;
+          updated = true;
+        }
+
+        // 30 MINUTES reminder - only for activities with specific time
+        // Fire when approximately 30 minutes remain (28-31 minute window to account for cron timing)
+        // The notified30Min flag ensures this only fires once
+        if (!activity.notified30Min && activity.time) {
+          const minutesUntilDeadline = deadline.diff(now, "minutes");
+          
+          // Trigger within 28-31 minute range to handle scheduler drift
+          // The notified30Min flag guarantees exactly-once behavior
+          if (minutesUntilDeadline >= 28 && minutesUntilDeadline <= 31) {
+            consolidatedReminders.thirtyMin.push({
+              name: displayName,
+              subject: activity.subject,
+              time: activity.time,
+              minutesLeft: minutesUntilDeadline
+            });
+            
+            activity.notified30Min = true;
+            updated = true;
+          }
+        }
+
+        // DEADLINE MET - activity has passed its deadline
+        let shouldEnd = false;
         
-        if (minutesUntilDeadline <= 30 && minutesUntilDeadline > 0) {
-          const displayName = getActivityDisplayName(activity.name);
+        if (activity.time) {
+          if (now.isAfter(deadline)) {
+            shouldEnd = true;
+          }
+        } else {
+          if (now.isSameOrAfter(dayAfterDeadline)) {
+            shouldEnd = true;
+          }
+        }
+
+        if (!activity.notifiedEnded && shouldEnd) {
+          consolidatedReminders.ended.push({
+            name: displayName,
+            subject: activity.subject
+          });
           
-          const messageBody = `⏰ URGENT REMINDER! ⏰\n\n@everyone\n\n🔴 Only ${minutesUntilDeadline} minutes left!\n\n📝 Activity: ${displayName}\n📚 Subject: ${activity.subject}\n📅 Deadline: ${activity.time}\n\nPlease pass the required output as soon as possible!`;
-          
-          sendToAllGroups(api, messageBody);
-          activity.notified30Min = true;
+          activity.notifiedEnded = true;
+          activity.ended = true;
           updated = true;
         }
       }
 
-      // Check if activity should be removed
-      // If time provided: remove after time deadline passed
-      // If no time: remove the day after deadline date
-      let shouldEnd = false;
+      // Build and send consolidated message for this group
+      let hasReminders = false;
+      let messageBody = "";
       
-      if (activity.time) {
-        // Has specific time - end when deadline time has passed
-        if (now.isAfter(deadline)) {
-          shouldEnd = true;
-        }
-      } else {
-        // No specific time - end the day after deadline
-        if (now.isSameOrAfter(dayAfterDeadline)) {
-          shouldEnd = true;
-        }
+      // NEXT WEEK reminders
+      if (consolidatedReminders.nextWeek.length > 0) {
+        hasReminders = true;
+        groupsWithNextWeekReminders.add(threadID);
+        messageBody += "📅 NEXT WEEK DEADLINES 📅\n\n";
+        messageBody += "⚠️ The following activities are due NEXT WEEK:\n\n";
+        consolidatedReminders.nextWeek.forEach(act => {
+          messageBody += `📝 ${act.name}\n`;
+          messageBody += `📚 Subject: ${act.subject}\n`;
+          messageBody += `📅 Due: ${act.dayName}, ${act.deadline}\n`;
+          messageBody += `⏳ Time remaining: ${act.timeRemaining}\n\n`;
+        });
+      }
+      
+      // THIS WEEK reminders
+      if (consolidatedReminders.thisWeek.length > 0) {
+        hasReminders = true;
+        if (messageBody) messageBody += "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+        messageBody += "📅 THIS WEEK DEADLINES 📅\n\n";
+        messageBody += "⚠️ The following activities are due THIS WEEK:\n\n";
+        consolidatedReminders.thisWeek.forEach(act => {
+          messageBody += `📝 ${act.name}\n`;
+          messageBody += `📚 Subject: ${act.subject}\n`;
+          messageBody += `📅 Due: ${act.dayName}, ${act.deadline}\n`;
+          messageBody += `⏳ Time remaining: ${act.timeRemaining}\n\n`;
+        });
+      }
+      
+      // 2 DAYS reminders
+      if (consolidatedReminders.twoDays.length > 0) {
+        hasReminders = true;
+        if (messageBody) messageBody += "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+        messageBody += "⚠️ 2 DAYS REMINDER ⚠️\n\n";
+        messageBody += "The following activities are due in 2 DAYS:\n\n";
+        consolidatedReminders.twoDays.forEach(act => {
+          messageBody += `📝 ${act.name}\n`;
+          messageBody += `📚 Subject: ${act.subject}\n`;
+          messageBody += `📅 Deadline: ${act.deadline}\n`;
+          messageBody += `⏳ Time remaining: ${act.timeRemaining}\n\n`;
+        });
+      }
+      
+      // TOMORROW reminders
+      if (consolidatedReminders.tomorrow.length > 0) {
+        hasReminders = true;
+        if (messageBody) messageBody += "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+        messageBody += "🚨 DEADLINE REMINDER! 🚨\n\n";
+        messageBody += "⚠️ The following activities are due TOMORROW:\n\n";
+        consolidatedReminders.tomorrow.forEach(act => {
+          messageBody += `📝 ${act.name}\n`;
+          messageBody += `📚 Subject: ${act.subject}\n`;
+          messageBody += `📅 Deadline: ${act.deadline}\n\n`;
+        });
+        messageBody += "Please make sure to complete and submit on time!\n\n";
+      }
+      
+      // TODAY reminders
+      if (consolidatedReminders.today.length > 0) {
+        hasReminders = true;
+        if (messageBody) messageBody += "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+        messageBody += "📢 TODAY'S DEADLINE! 📢\n\n";
+        messageBody += "🔴 The following activities are due TODAY:\n\n";
+        consolidatedReminders.today.forEach(act => {
+          messageBody += `📝 ${act.name}\n`;
+          messageBody += `📚 Subject: ${act.subject}\n`;
+          messageBody += `📅 Deadline: ${act.deadline}\n\n`;
+        });
+        messageBody += "Make sure to submit before the deadline!\n\n";
+      }
+      
+      // 30 MINUTES reminders
+      if (consolidatedReminders.thirtyMin.length > 0) {
+        hasReminders = true;
+        if (messageBody) messageBody += "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+        messageBody += "⏰ URGENT REMINDER! ⏰\n\n";
+        consolidatedReminders.thirtyMin.forEach(act => {
+          messageBody += `🔴 Only ${act.minutesLeft} minutes left!\n\n`;
+          messageBody += `📝 ${act.name}\n`;
+          messageBody += `📚 Subject: ${act.subject}\n`;
+          messageBody += `📅 Deadline: ${act.time}\n\n`;
+        });
+        messageBody += "Please pass the required output as soon as possible!\n\n";
+      }
+      
+      // Send consolidated reminder message
+      if (hasReminders && messageBody) {
+        await sendSimpleMessage(api, threadID, messageBody.trim());
+        groupsWithReminders.add(threadID);
+      }
+      
+      // DEADLINE MET messages (sent separately as they remove activities)
+      if (consolidatedReminders.ended.length > 0) {
+        let endedMessage = "📢 DEADLINE MET\n\n";
+        consolidatedReminders.ended.forEach(act => {
+          endedMessage += `📝 ${act.name}\n`;
+          endedMessage += `📚 Subject: ${act.subject}\n\n`;
+        });
+        endedMessage += "These activities have passed their deadlines and have been removed from the list.";
+        
+        await sendSimpleMessage(api, threadID, endedMessage.trim());
       }
 
-      if (!activity.notifiedEnded && shouldEnd) {
-        const displayName = getActivityDisplayName(activity.name);
-        
-        const messageBody = `📢 DEADLINE MET\n\n📝 Activity: ${displayName}\n📚 Subject: ${activity.subject}\n\nThis activity has now passed its deadline and has been removed from the list.`;
-        
-        sendToAllGroups(api, messageBody);
-        
-        activity.notifiedEnded = true;
-        activity.ended = true;
-        updated = true;
+      if (updated) {
+        // Remove ended activities and save
+        const activeActivities = activities.filter(a => !a.ended);
+        saveGroupActivities(threadID, activeActivities);
       }
-    });
-
-    if (updated) {
-      // Remove ended activities
-      const activeActivities = activities.filter(a => !a.ended);
-      saveActivities(activeActivities);
+    }
+    
+    // Send motivational message after NEXT WEEK reminders
+    // Only send on Friday or Saturday when NEXT WEEK reminders are present
+    if (groupsWithNextWeekReminders.size > 0 && 
+        isFridayOrSaturday && 
+        lastMotivationalTimeSlot !== currentTimeSlot) {
+      lastMotivationalTimeSlot = currentTimeSlot;
+      
+      // Wait a moment for all reminders to be sent, then send motivational message
+      setTimeout(async () => {
+        for (const threadID of groupsWithNextWeekReminders) {
+          await sendSimpleMessage(api, threadID, "Kumilos kilos kana wag tatamad-tamad 😇😇");
+        }
+      }, 3000); // Wait 3 seconds after reminders
     }
   });
 
   console.log("✅ Scheduled tasks initialized");
   console.log(`📢 Tracking ${groupThreadIDs.size} group(s) for reminders`);
+}
+
+// Scan all groups and initialize their data on startup
+function scanAndInitializeGroups(api) {
+  console.log("🔍 Scanning groups and initializing data...");
+  
+  // Get current thread list to find all groups the bot is in
+  api.getThreadList(100, null, ["INBOX"], (err, threads) => {
+    if (err) {
+      console.error("Failed to get thread list:", err.message);
+      return;
+    }
+    
+    let groupCount = 0;
+    
+    threads.forEach(thread => {
+      if (thread.isGroup && thread.threadID) {
+        // Add to tracked groups if not already tracked
+        if (!groupThreadIDs.has(thread.threadID)) {
+          groupThreadIDs.add(thread.threadID);
+          console.log(`📢 Found group: ${thread.name || thread.threadID}`);
+        }
+        
+        // Initialize group data (all groups get legacy migration if available)
+        initializeGroupData(thread.threadID, true);
+        groupCount++;
+      }
+    });
+    
+    // Save updated group threads
+    saveGroupThreads(groupThreadIDs);
+    console.log(`✅ Initialized ${groupCount} groups`);
+  });
 }
 
 // Main Bot Login
@@ -873,6 +1382,9 @@ function startBot() {
     // Save updated appstate
     fs.writeFileSync(APPSTATE_FILE, JSON.stringify(api.getAppState(), null, 2));
 
+    // Scan and initialize all groups
+    scanAndInitializeGroups(api);
+
     // Setup scheduled tasks
     setupScheduledTasks(api);
 
@@ -885,12 +1397,17 @@ function startBot() {
         return;
       }
 
-      // Track ALL group thread IDs for notifications
+      // Track ALL group thread IDs for notifications and initialize data
       if (event.isGroup && event.threadID) {
-        if (!groupThreadIDs.has(event.threadID)) {
+        const isNewGroup = !groupThreadIDs.has(event.threadID);
+        if (isNewGroup) {
           groupThreadIDs.add(event.threadID);
           saveGroupThreads(groupThreadIDs);
+          initializeGroupData(event.threadID, false); // New groups don't get legacy migration
           console.log(`📢 New group registered: ${event.threadID} (Total: ${groupThreadIDs.size} groups)`);
+        } else if (!initializedGroups.has(event.threadID)) {
+          // Existing group but not initialized this session
+          initializeGroupData(event.threadID, false);
         }
       }
 
@@ -900,10 +1417,11 @@ function startBot() {
         const botWasAdded = addedParticipants.some(p => p.userFbId === botID);
         
         if (botWasAdded && event.threadID) {
-          // Add this group to the tracked list
+          // Add this group to the tracked list and initialize data
           if (!groupThreadIDs.has(event.threadID)) {
             groupThreadIDs.add(event.threadID);
             saveGroupThreads(groupThreadIDs);
+            initializeGroupData(event.threadID, false);
             console.log(`📢 Bot added to new group: ${event.threadID} (Total: ${groupThreadIDs.size} groups)`);
           }
           
@@ -956,7 +1474,7 @@ function startBot() {
           try {
             // For batch mode, we need to capture results instead of sending individual messages
             if (commandName === "addact") {
-              const batchResult = executeBatchAddact(args, event.senderID);
+              const batchResult = executeBatchAddact(args, event.senderID, event.threadID);
               if (batchResult.success) {
                 successCount++;
                 results.push(`✅ ${batchResult.activityName} - Added`);
